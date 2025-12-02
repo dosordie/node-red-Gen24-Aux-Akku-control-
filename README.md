@@ -47,7 +47,7 @@ Der Flow besteht im Kern aus drei Function-Nodes plus ein paar ioBroker-I/O-Knot
 Dazu kommen:
 
 - `ioBroker in` für Freigaben & Parameter aus Gira / Modbus
-- `ioBroker out` auf die BYD-Register `40365_OutWRte` und `40366_InWRte`
+- `ioBroker out` auf die GEN24-Register `40365_OutWRte` und `40366_InWRte`
 - ein `inject`-Node, der alle 3 s triggert
 
 ## 2. Flow-Import
