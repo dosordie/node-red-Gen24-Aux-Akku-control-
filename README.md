@@ -1,16 +1,20 @@
-# Node-RED – BYD Aux-Akku 2 Regelung
+# Node-RED: Automatische Lade-/Entlade-Steuerung für zweiten BYD-Akku
 
-Dieses Repository enthält die Node-RED-Logik zur Steuerung eines zweiten BYD-Akkus (Aux-Akku) an einem separaten GEN24.
+Dieses Projekt enthält eine Node-RED-Logik zur automatischen Steuerung eines zweiten BYD-Speichers
+(z. B. kleiner WR an einer Ost/West-Anlage), basierend auf:
 
-Die Regelung besteht aus zwei Funktionsknoten:
+- Netzbezug / Einspeisung (Smart Meter)
+- SoC von Haupt- und Nebenakku
+- Lade-/Entladeleistung des Hauptakkus
+- Zellspannung Akku 2
+- Freigaben aus der Visualisierung (Gira)
 
-1. **BYD2 Hauptlogik**  
-   Arbeitet auf Watt-Basis (`P_set_aux`) und entscheidet, ob und wie stark Akku 2 laden oder entladen soll.
+Ziele:
 
-2. **BYD2 Ausgangslogik**  
-   Wandelt `P_set_aux` in die beiden BYD-Register **InWRte** und **OutWRte** um, inklusive richtiger Vorzeichen, Reihenfolge und Delay.
-
----
+- PV-Überschüsse in Akku 2 laden (CHG_SURPLUS)
+- Grundlast und/oder Hauptakku beim Entladen unterstützen (DIS_BASE)
+- sanfte Rampen + Hysterese
+- BYD-Register **InWRte / OutWRte** sauber und ohne Modbus-Fehler beschreiben
 
 ## 1. Architektur
 
@@ -45,6 +49,7 @@ Dazu kommen:
 - `ioBroker in` für Freigaben & Parameter aus Gira / Modbus
 - `ioBroker out` auf die BYD-Register `40365_OutWRte` und `40366_InWRte`
 - ein `inject`-Node, der alle 3 s triggert
+
 ## 2. Flow-Import
 
 Der komplette Flow liegt als Node-RED-JSON (Gruppe „Automatische Lade / Entlade steuerung“)
@@ -65,41 +70,23 @@ mit u. a.:
    - ioBroker-Topics ggf. an deine Instanz anpassen (Adapter-ID, Index).
    - Deploy.
 
-   ## 3. Ein-/Ausgänge der Hauptlogik
+## 3. Ein-/Ausgänge der Hauptlogik
 
-### 3.1 Trigger
+- **Trigger**
+  - `inject`-Node „Alle 3 Sekunden“
+  - `msg.payload` wird ignoriert, dient nur als Takt
 
-- `inject`-Node „Alle 3 Sekunden“ triggert die Hauptfunktion.
-- `msg.payload` wird nur als Takt verwendet und in der Funktion ignoriert.
+- **Output 0 – P_set_aux (W)**
+  - `msg.payload` = Leistung für Akku 2
+    - `> 0` → Laden
+    - `< 0` → Entladen
+    - `= 0` → neutral
+  - send-by-change mit Deadband `P_SET_DEADBAND_W`
+    (kleine Änderungen werden unterdrückt, 0-/Vorzeichenwechsel wird immer gesendet)
 
-### 3.2 Output 0 – P_set_aux (W)
-
-- `msg.payload` = gewünschte Leistung für Akku 2:
-
-  - `> 0` → Akku 2 **laden**
-  - `< 0` → Akku 2 **entladen**
-  - `= 0` → neutral
-
-- send-by-change mit Deadband `P_SET_DEADBAND_W` (z. B. 20 W):
-  - kleine Änderungen werden unterdrückt
-  - bei Wechsel von Laden ↔ Entladen oder auf 0 wird immer gesendet
-
-### 3.3 Output 1 – Debug-Objekt
-
-- `msg.payload` = Objekt mit u. a.:
-
-  - `state`, `stateBase`, `disMode`
-  - `P_grid`, `P_house`
-  - `SoC_main`, `SoC_aux`, `socAuxMinDischarge`
-  - `P_main_chg`, `P_main_dis`, `P_aux_chg`, `P_aux_dis`
-  - `auxChargeEnable`, `auxDischargeEnable`
-  - `tGridImportHigh`, `tGridExportHigh`, `tImportStop`, `tStateHold`
-  - `P_set_aux`, `lastSupportTarget`
-  - `chargeLimitActive`, `auxLimitFullEnable`, `auxCellMaxV`, `effectiveMaxChargeW`
-  - `failsafeReason`
-
-Das Debug-Objekt geht weiter in **„Visu Status Text“**, wo es in einen kompakten String
-für die Gira-Visu umgebaut wird.
+- **Output 1 – Debug-Objekt**
+  - enthält alle relevanten Zustände (State, SoC, Leistungen, Timer, Limits, Failsafe)
+  - wird nur bei Änderungen gesendet (SBC)
 
 ## 4. Benötigte Variablen
 
@@ -118,193 +105,51 @@ für die Gira-Visu umgebaut wird.
 | `OstWest_Freigabe_Akku_Autom_Laden`  | Auto-Laden freigegeben (bool)                      |
 | `OstWest_Freigabe_Akku_Autom_Entladen` | Auto-Entladen freigegeben (bool)                 |
 
-Diese Keys werden über kleine Helper-Funktionen aus ioBroker-Werten befüllt.
-
 ### 4.2 Flow-Variablen (`flow.get`)
 
 | Key                              | Bedeutung                                           |
 |----------------------------------|-----------------------------------------------------|
 | `OstWest_Akku_min_SoC`           | Minimaler SoC für Entladen Akku 2 (%)              |
 | `OstWest_Akku_Limit_Charge_Full` | Limit bei fast voll aktiv (Zellspannung) (bool)    |
-| `byd_1-olli_mVoltMax`           | maximal gemessene Zellspannung Akku 2 (V, 3 Stellen) |
+| `byd_1-olli_mVoltMax`            | maximal gemessene Zellspannung Akku 2 (V, 3 Stellen) |
 
 ## 5. State-Machine
 
 ### 5.1 Zustände
 
 - `IDLE`  
-  - kein aktives Laden/Entladen  
-  - `P_set_aux` wird langsam auf 0 zurückgeführt
+  - kein aktives Laden/Entladen, P langsam Richtung 0
 
 - `CHG_SURPLUS`  
-  - PV-Überschuss laden  
-  - `P_set_aux > 0`
+  - PV-Überschuss in Akku 2 laden
 
 - `DIS_BASE`  
-  - Entladen zur Grundlastdeckung / Hauptakku-Support  
-  - `P_set_aux < 0`  
-  - Untermodi:
-    - `GRID`: Netzbezug reduzieren
-    - `SUPPORT`: Entladeleistung nach Kapazitätsverhältnis teilen
+  - Akku 2 entlädt
+  - Modi:
+    - `GRID` → Netzbezug/Grundlast reduzieren
+    - `SUPPORT` → Hauptakku beim Entladen entlasten
 
 - `FREEZE`  
-  - Failsafe bei ungültigen Werten (z. B. `NaN` bei SoC/Leistung)  
-  - `P_set_aux → 0`, bis die Werte wieder plausibel sind
+  - Failsafe bei ungültigen Werten (SoC/Leistungen ungültig)  
+  - P → 0, bis Werte wieder plausibel
 
-### 5.2 Beispiel-Übergänge
+### 5.2 Typische Übergänge (vereinfacht)
 
-- **IDLE → CHG_SURPLUS**, wenn:
-  - Auto-Laden freigegeben (`OstWest_Freigabe_Akku_Autom_Laden`)
-  - SoC Hauptakku ≥ `SOC_MAIN_MIN_FOR_AUX_CHARGE`
-  - Hauptakku entlädt nicht stark (`P_main_dis` unter Schwellwert)
-  - signifikanter Export (`P_grid` deutlich negativ) über `CHG_START_DELAY_S`
+- `IDLE → CHG_SURPLUS`
+  - Auto-Laden frei, SoC Hauptakku hoch genug,
+  - Hauptakku entlädt nicht stark,
+  - relevanter Export über `CHG_START_DELAY_S`.
 
-- **IDLE → DIS_BASE (GRID)**, wenn:
-  - Auto-Entladen freigegeben
-  - SoC Akku 2 > Minimal-SoC
-  - signifikanter Netzbezug über `DIS_START_DELAY_S`
+- `IDLE → DIS_BASE (GRID)`
+  - Auto-Entladen frei,
+  - SoC Akku 2 > Min-SoC,
+  - relevanter Import über `DIS_START_DELAY_S`.
 
-- **IDLE → DIS_BASE (SUPPORT)**, wenn:
-  - Auto-Entladen freigegeben
-  - SoC Akku 2 > Minimal-SoC
-  - Hauptakku entlädt mit mindestens `MAIN_DIS_SUPPORT_ENTRY_W`
+- `IDLE → DIS_BASE (SUPPORT)`
+  - Auto-Entladen frei,
+  - SoC Akku 2 > Min-SoC,
+  - Hauptakku entlädt über `MAIN_DIS_SUPPORT_ENTRY_W`.
 
-## 6. Berechnung von P_set_aux
+- Zurück nach `IDLE`
+  - Freigaben weg, SoC zu niedrig oder kein Import/Support-Bedarf mehr.
 
-### 6.1 CHG_SURPLUS (Laden aus Überschuss)
-
-`P_grid`-basierte Korrektur:
-
-- Einspeisung (`P_grid < -GRID_TOLERANCE_W`)  
-  → `P_surplus = -P_grid` (mehr laden)
-- Import (`P_grid > GRID_TOLERANCE_W`)  
-  → `P_surplus = -P_grid` (Ladeleistung reduzieren)
-- nahe 0  
-  → `P_surplus = 0`
-
-Ziel:
-
-```js
-let P_target = P_aux_chg + P_surplus;  // aktuelle Ladeleistung + Korrektur
-if (P_target < 0) P_target = 0;
-
-P_target = Math.min(
-  P_target,
-  AUX_WR_AC_MAX_W,
-  effectiveMaxChargeW   // Zellspannungs-/C-Rate-Limit
-);
-
-P_set_aux_new = P_target; // > 0 = Laden
-let P_base_need;
-
-if (isFinite(P_house) && P_house > 0) {
-  P_base_need = Math.min(P_house, BASELOAD_TARGET_W);
-} else {
-  P_base_need = Math.min(Math.max(P_grid, 0), BASELOAD_TARGET_W);
-}
-
-let target = Math.min(P_base_need, BASELOAD_TARGET_W, AUX_WR_AC_MAX_W);
-P_set_aux_new = -Math.max(0, Math.round(target)); // < 0 = Entladen
-
-
----
-
-### Block 7 – Rampe & Dynamik
-
-```markdown
-## 7. Rampe & Dynamik
-
-Es gibt getrennte Rampen für Laden und Entladen:
-
-- **Laden (CHG)**  
-  - max. Schritt: `AUX_P_DELTA_MAX_CHG_W` (z. B. 200 W)  
-  - min. Zeit zwischen zwei „größer werden“-Schritten:
-    `RAMP_MIN_HOLD_CHG_S` (z. B. 10 s)
-
-- **Entladen (DIS)**  
-  - max. Schritt: `AUX_P_DELTA_MAX_DIS_W` (z. B. 80 W)  
-  - min. Zeit zwischen zwei „größer werden“-Schritten:
-    `RAMP_MIN_HOLD_DIS_S` (z. B. 30 s)
-
-Im SUPPORT-Modus werden Änderungen zusätzlich „gehalten“, damit der WR nicht ständig
-zwischen Stufen hin- und herspringt.
-
-Generell:
-
-- Betrag größer → nur alle X Sekunden  
-- Betrag kleiner → darf schneller folgen (innerhalb Δ-Max-Grenze)
-- sehr kleine Leistungen (`|P_set_aux| < 10 W`) werden auf 0 geklemmt
-
-## 8. BYD-Ausgangslogik (InWRte / OutWRte)
-
-Funktion: **DIE Ausgangs Logik V2**
-
-### 8.1 Grundprinzip
-
-- Input: `P_set_aux` (W)
-- Umrechnung in Prozent relativ zu `AUX_BAT_MAX_W`
-- 1 Nachkommastelle
-
-Modus:
-
-- `P_set_aux > 0` → **CHG (Laden erzwingen)**  
-  - `InWRte = +X`, `OutWRte = -X`
-
-- `P_set_aux < 0` → **DIS (Entladen erzwingen)**  
-  - `OutWRte = +X`, `InWRte = -X`
-
-- `P_set_aux = 0` → Spezialfall:
-  - zuerst das **negative** Register auf 0
-  - dann das andere Register mit Delay (`msg.delay = NEG_DELAY_MS`)
-
-### 8.2 Reihenfolge & Delay
-
-- Negative Werte (oder zweiter Schritt bei 0-Stellung) bekommen ein Delay,
-  damit die BYD-Firmware die Sequenz sicher verarbeiten kann.
-- Umsetzung über `delay`-Node im Modus **delayv**:
-  - Input: `msg.delay` (ms)
-  - danach geht es zum jeweiligen `ioBroker out` (Modbus-Adapter).
-
-### 8.3 Outputs
-
-- **Output 0**: `InWRte` → `modbus.7.holdingRegisters.1.40366_InWRte`
-- **Output 1**: `OutWRte` → `modbus.7.holdingRegisters.1.40365_OutWRte`
-
-Beide Ausgänge sind send-by-change (SBC), d. h. es werden nur Änderungen gesendet.
-
-## 9. Visualisierung (Gira)
-
-### 9.1 Visu Status Text
-
-Function-Node **„Visu Status Text“** nimmt das Debug-Objekt (2. Ausgang der Hauptlogik)
-und erzeugt einen String, z. B.:
-
-```text
-Mode=CHG_SURPLUS | Akku=1200W
-
-
----
-
-### Block 10 – Tuning
-
-```markdown
-## 10. Tuning
-
-Typische Stellschrauben in der Hauptfunktion:
-
-- **Laden zu träge?**
-  - `AUX_P_DELTA_MAX_CHG_W` erhöhen (größere Schritte)
-  - `RAMP_MIN_HOLD_CHG_S` verkleinern (häufiger nachregeln)
-
-- **Entladen zu nervös?**
-  - `AUX_P_DELTA_MAX_DIS_W` verkleinern
-  - `RAMP_MIN_HOLD_DIS_S` vergrößern
-  - ggf. `BASELOAD_TARGET_W` etwas erhöhen oder `GRID_TOLERANCE_W` anpassen
-
-- **SUPPORT-Modus „zittert“?**
-  - `SUPPORT_STEP_W` erhöhen (gröbere Stufen)
-  - `SUPPORT_TARGET_HYST_W` erhöhen (größere Hysterese)
-
-- **Akku 2 bei hoher Zellspannung zu aggressiv?**
-  - `AUX_MAX_CELL_V` etwas niedriger wählen
-  - `AUX_MAX_CHARGE_FULL_W` kleiner wählen
