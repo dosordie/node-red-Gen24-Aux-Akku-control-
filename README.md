@@ -309,7 +309,3 @@ Typische Stellschrauben in der Hauptfunktion:
 - **SUPPORT-Modus „zittert“ zwischen Stufen?**
   - `SUPPORT_STEP_W` erhöhen (gröbere Stufen)
   - `SUPPORT_TARGET_HYST_W` erhöhen (größere Hysterese)
-
-- **Akku 2 wird bei hoher Zellspannung zu aggressiv geladen?**
-  - `AUX_MAX_CELL_V` etwas senken
-  - `AUX_MAX_CHARGE_FULL_W` verringern
