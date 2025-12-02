@@ -153,3 +153,163 @@ mit u. a.:
 - Zurück nach `IDLE`
   - Freigaben weg, SoC zu niedrig oder kein Import/Support-Bedarf mehr.
 
+## 6. Berechnung von P_set_aux (vereinfacht)
+
+### 6.1 CHG_SURPLUS (Laden)
+
+- Korrektur basiert auf `P_grid`:
+  - Einspeisung → Ladeleistung erhöhen
+  - Netzbezug → Ladeleistung reduzieren
+  - nahe 0 → Ladeleistung halten
+
+- Zielgröße:
+
+    P_target = P_aux_chg + P_surplus        // Ist-Laden + Korrektur
+    if (P_target < 0) P_target = 0
+
+    P_target = min(
+        P_target,
+        AUX_WR_AC_MAX_W,
+        effectiveMaxChargeW   // C-Rate + Zellspannungs-Limit
+    )
+
+    P_set_aux_new = P_target                 // > 0 = Laden
+
+
+### 6.2 DIS_BASE (Entladen)
+
+- GRID-Modus (Netzbezug / Grundlast reduzieren):
+
+    if (P_house vorhanden):
+        P_base_need = min(P_house, BASELOAD_TARGET_W)
+    else:
+        P_base_need = min(max(P_grid, 0), BASELOAD_TARGET_W)
+
+    target        = min(P_base_need, BASELOAD_TARGET_W, AUX_WR_AC_MAX_W)
+    P_set_aux_new = -round(target)          // < 0 = Entladen
+
+- SUPPORT-Modus (Hauptakku entlasten):
+
+    P_main_dis_pos   = max(P_main_dis, 0)
+    P_aux_target_raw = P_main_dis_pos / MAIN_TO_AUX_CAP_RATIO
+    P_aux_target     = min(P_aux_target_raw, AUX_WR_AC_MAX_W)
+
+    // auf SUPPORT_STEP_W runden + Hysterese via SUPPORT_TARGET_HYST_W
+
+    if (P_aux_target < SUPPORT_STEP_W):
+        P_set_aux_new = 0
+    else:
+        P_set_aux_new = -P_aux_target
+
+## 7. Rampe & Dynamik
+
+- Getrennte Rampen für **Laden** und **Entladen**:
+
+  - Laden:
+    - max. Schritt: `AUX_P_DELTA_MAX_CHG_W`
+    - min. Haltezeit: `RAMP_MIN_HOLD_CHG_S`
+  - Entladen:
+    - max. Schritt: `AUX_P_DELTA_MAX_DIS_W`
+    - min. Haltezeit: `RAMP_MIN_HOLD_DIS_S`
+
+- Logik:
+  - Wenn der Betrag von `P_set_aux_new` größer werden soll:
+    - nur alle `rampHoldMinS` Sekunden erhöhen
+  - Wenn der Betrag kleiner wird:
+    - schneller nachführen (bis max. `AUX_P_DELTA_MAX_*_W` je Tick)
+
+- SUPPORT-Modus:
+  - zusätzliche Halte-Logik, damit nicht dauernd zwischen Stufen gewechselt wird.
+
+- Kleinkram:
+  - `|P_set_aux| < 10 W` → auf 0 geklemmt
+  - Begrenzung auf `[-AUX_WR_AC_MAX_W, +AUX_WR_AC_MAX_W]`.
+
+## 8. BYD-Ausgangslogik (InWRte / OutWRte)
+
+Funktion: **DIE Ausgangs Logik V2**
+
+- Input: `P_set_aux` (W)
+- Output:
+  - `InWRte` (%), 1 Nachkommastelle
+  - `OutWRte` (%), 1 Nachkommastelle
+- Umrechnung:
+  - Prozent relativ zu `AUX_BAT_MAX_W`
+  - Werte werden auf ±100 % begrenzt und auf 0,1 % gerundet.
+
+### 8.1 Modus / Mapping
+
+- `P_set_aux > 0` → **Laden (CHG)**  
+  - `InWRte = +X`, `OutWRte = -X`
+
+- `P_set_aux < 0` → **Entladen (DIS)**  
+  - `OutWRte = +X`, `InWRte = -X`
+
+- `P_set_aux = 0` → **geordnete 0-Sequenz**:
+  - war `InWRte < 0` → erst `InWRte = 0`, dann `OutWRte = 0` mit Delay
+  - war `OutWRte < 0` → erst `OutWRte = 0`, dann `InWRte = 0` mit Delay
+  - sonst beide direkt auf 0
+
+Damit wird sichergestellt, dass BYD bei Richtungswechseln / Freigabe
+keine „Illegal Value“-Fehler wirft.
+
+### 8.2 Delay & SBC
+
+- Schritte, in denen negative Werte geschrieben werden oder die zweite 0-Stufe:
+  - `msg.delay = NEG_DELAY_MS` (z. B. 500 ms).
+- Hinter der Funktion hängt ein `delay`-Node mit „delayv“-Modus.
+- In/Out werden nur bei Änderung gesendet (send-by-change).
+- Node-Status:
+  - `P=…W  In=…%  Out=…%` zur schnellen Kontrolle.
+
+## 9. Visualisierung (Gira)
+
+### 9.1 Visu Status Text
+
+Function-Node **„Visu Status Text“**:
+
+- Input: Debug-Objekt (2. Ausgang der Hauptlogik)
+- Output: kompakter String, z. B.:
+
+    Mode=CHG_SURPLUS | Akku=1200W
+
+- Konfigurierbare Felder (Array `FIELDS` im Code, z. B. `state`, `P_set_aux`).
+- send-by-change:
+  - Text wird nur gesendet, wenn er sich ändert.
+- Node-Status zeigt denselben Text.
+
+### 9.2 Gira Endpoint
+
+Function-Node **„OstWest_Funktion_Status_txt“**:
+
+- Baut aus dem Status-String ein JSON für den `gira-endpoint`-Adapter.
+- Key: `CO@OstWest_Funktion_Status_txt`
+- `msg.payload` enthält:
+  - `type: "call"`
+  - `param.key`: `CO@OstWest_Funktion_Status_txt`
+  - `param.method`: `"set"`
+  - `param.value`: Text
+
+So steht der aktuelle Betriebszustand in der Gira-Visu zur Verfügung
+(z. B. als Textfeld unter dem Akku-Symbol).
+
+## 10. Tuning
+
+Typische Stellschrauben in der Hauptfunktion:
+
+- **Laden zu träge?**
+  - `AUX_P_DELTA_MAX_CHG_W` erhöhen (größere Leistungsschritte)
+  - `RAMP_MIN_HOLD_CHG_S` verkleinern (schneller nachregeln)
+
+- **Entladen zu nervös?**
+  - `AUX_P_DELTA_MAX_DIS_W` verkleinern
+  - `RAMP_MIN_HOLD_DIS_S` vergrößern
+  - ggf. `BASELOAD_TARGET_W` und `GRID_TOLERANCE_W` anpassen
+
+- **SUPPORT-Modus „zittert“ zwischen Stufen?**
+  - `SUPPORT_STEP_W` erhöhen (gröbere Stufen)
+  - `SUPPORT_TARGET_HYST_W` erhöhen (größere Hysterese)
+
+- **Akku 2 wird bei hoher Zellspannung zu aggressiv geladen?**
+  - `AUX_MAX_CELL_V` etwas senken
+  - `AUX_MAX_CHARGE_FULL_W` verringern
