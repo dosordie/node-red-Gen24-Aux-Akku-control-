@@ -1,0 +1,716 @@
+[
+  {
+    "id": "6c65f7ab7f9d95a6",
+    "type": "group",
+    "z": "27329a7f09243cee",
+    "name": "Automatische Lade / Entlade steuerung",
+    "style": {
+      "label": true
+    },
+    "nodes": [
+      "620dd57e781859c1",
+      "256bc14883438b2a",
+      "5032abb032dce2ab",
+      "b6c4d9d1f96d29ec",
+      "16f2f10796b2f552",
+      "94da46bb600a0c5e",
+      "eac9915a7c1746ad",
+      "e50c30692daafeb0",
+      "69abf3d69c93f64e",
+      "2e6484630f7f6c2a",
+      "b2ca0bbb9263d670",
+      "fa4b06952e2cca38",
+      "c2a1831936ef2858",
+      "2840a440d760afd1",
+      "e59afd742522cc54",
+      "2c76319d84bb1869",
+      "8295aca0eb955f76",
+      "0bfae37788036102",
+      "6abd811bf6ce2ee7",
+      "28470fdc86149a0d",
+      "2d15ca9c76b753cd",
+      "8cf9c4224e75567b",
+      "a848c1995e5b6c48",
+      "4e1e789e9d2596fa",
+      "8fe006138f89debb",
+      "b44640ba25718304",
+      "bcdad9a1b5fbe948",
+      "2dd9451432527163",
+      "107e07a1676989c7",
+      "de0282d370c82790"
+    ],
+    "x": 14,
+    "y": -1,
+    "w": 1692,
+    "h": 462
+  },
+  {
+    "id": "620dd57e781859c1",
+    "type": "ioBroker out",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "",
+    "topic": "modbus.7.holdingRegisters.1.40365_OutWRte",
+    "ack": "false",
+    "autoCreate": "false",
+    "stateName": "",
+    "role": "",
+    "payloadType": "",
+    "readonly": "",
+    "stateUnit": "",
+    "stateMin": "",
+    "stateMax": "",
+    "x": 1500,
+    "y": 340,
+    "wires": []
+  },
+  {
+    "id": "256bc14883438b2a",
+    "type": "ioBroker out",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "",
+    "topic": "modbus.7.holdingRegisters.1.40366_InWRte",
+    "ack": "false",
+    "autoCreate": "false",
+    "stateName": "",
+    "role": "",
+    "payloadType": "",
+    "readonly": "",
+    "stateUnit": "",
+    "stateMin": "",
+    "stateMax": "",
+    "x": 1490,
+    "y": 260,
+    "wires": []
+  },
+  {
+    "id": "5032abb032dce2ab",
+    "type": "function",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "DIE 2. Akku Steuerung V4",
+    "func": "// Node-RED Function: BYD2 Hauptlogik\n// Output 0: msg.payload = P_set_aux (W)  [SBC mit Deadband]\n// Output 1: msg.payload = Debug-Objekt\n\n\n// -------------------------\n// Allgemein / Takt / Failsafe\n// -------------------------\n\nconst TICK_INTERVAL_S  = 3;    // Wie oft die Funktion typischerweise getriggert wird (nur Info/Doc)\nconst FAILSAFE_ACTIVE  = true; // true = bei ungültigen Messwerten in FREEZE gehen\n\n// Ab welcher Änderung die Funktion am Ausgang überhaupt sendet (SBC-Deadband)\nconst P_SET_DEADBAND_W = 20;   // Änderungen von P_set_aux < 20 W werden ignoriert\n\n\n// -------------------------\n// Leistungs-Grenzen / -Schwellen\n// -------------------------\n\nconst AUX_BAT_MAX_W     = 7680; // Max. Lade-/Entladeleistung Akku 2 laut BYD-Setpoint (für %-Berechnung)\nconst AUX_WR_AC_MAX_W   = 3000; // Max. AC-Leistung des kleinen WR (physikalische Grenze am Netz)\n\nconst BASELOAD_TARGET_W = 400;  // Ziel-Grundlast, die Akku 2 im DIS_BASE (GRID-Modus) maximal decken soll\n\nconst GRID_IMPORT_MIN_W = 150;  // Ab diesem Netzbezug (W) wird GRID-Import als „relevant“ betrachtet\nconst GRID_EXPORT_MIN_W = 150;  // Ab dieser Einspeisung (W) wird GRID-Export als „relevant“ betrachtet\nconst GRID_TOLERANCE_W  = 50;   // Toleranz-Band um 0 W, um Flattern zu vermeiden\n\n\n// -------------------------\n// Delays / Trägheit\n// -------------------------\n\nconst DIS_START_DELAY_S       = 40; // Dauer mit relevantem Netzbezug, bevor DIS_BASE (GRID) startet\nconst CHG_START_DELAY_S       = 20; // Dauer mit relevantem Export, bevor CHG_SURPLUS startet\nconst MIN_STATE_HOLD_TIME_S   = 15; // Mindestzeit, die ein Zustand gehalten werden muss\n\n// Wie lange kleiner Import / 0 W am Netzpunkt anliegen muss,\n// bevor CHG_SURPLUS beendet werden darf (zusätzlich zu anderen Bedingungen)\nconst CHG_STOP_IMPORT_DELAY_S = 25; // in Sekunden\n\n\n// -------------------------\n// SoC-Logik\n// -------------------------\n\nconst SOC_MAIN_MIN_FOR_AUX_CHARGE   = 15; // Hauptakku-SoC muss mind. so hoch sein, damit Akku 2 aktiv geladen wird\n\nconst SOC_AUX_MIN_DISCHARGE_DEFAULT = 5;  // Fallback: Unter diesem SoC entlädt Akku 2 nicht mehr aktiv\n\n\n// -------------------------\n// Interaktion mit Hauptakku\n// -------------------------\n\nconst MAIN_DISCHARGE_WEAK_W   = 200;  // Bis zu dieser Entladeleistung des Hauptakkus ist „leichtes“ Entladen ok\nconst MAIN_DISCHARGE_STRONG_W = 500;  // Ab dieser Entladeleistung wird CHG_SURPLUS (Laden Akku 2) beendet/blockiert\n\n// Support-Mode für DIS_BASE (Hauptakku entlasten):\nconst MAIN_DIS_SUPPORT_ENTRY_W = 400; // Ab dieser Entladeleistung Hauptakku → SUPPORT-Modus erlaubt\nconst MAIN_DIS_SUPPORT_EXIT_W  = 100; // Fällt P_main_dis darunter → SUPPORT-Modus Ende\n\n// Entlade-Verhältnis Haupt/Aux: z.B. 12.8 kWh / 7.7 kWh = 1.662\n// Ziel: beide Akkus entladen grob proportional zu ihrer Kapazität\nconst MAIN_TO_AUX_CAP_RATIO    = 1.662; // P_aux ≈ P_main / 1.662\n\n// Schrittweite für Unterstützungsleistung von Akku 2 im SUPPORT-Modus\nconst SUPPORT_STEP_W           = 70;    // in W, z.B. 70 W\n\n// Hysterese für Ziel-Leistung im SUPPORT-Modus\nconst SUPPORT_TARGET_HYST_W    = 100;   // in W – neue Zielstufe nur bei >= 100 W Differenz\n\n\n// -------------------------\n// Ladeleistung begrenzen wenn Akku „voll“ wird\n// -------------------------\n\nconst AUX_MAX_CELL_V        = 3.440; // Zellspannungs-Grenze (V), ab der Ladeleistung begrenzt wird\nconst AUX_MAX_CHARGE_FULL_W = 384;   // Max. Ladeleistung (W), wenn AUX_MAX_CELL_V überschritten ist\n\n// Basis-Limit für Ladeleistung im CHG_SURPLUS (z.B. 0,2C)\nconst MAX_CHG_POWER_W       = 1536;  // in W, muss <= AUX_WR_AC_MAX_W sein\n\n\n// -------------------------\n// Rampe (getrennt Laden / Entladen)\n// -------------------------\n\n// Laden: schneller hochfahren\nconst AUX_P_DELTA_MAX_CHG_W = 200; // max. Änderung pro Tick beim Laden (W)\nconst RAMP_MIN_HOLD_CHG_S   = 10;  // min. Zeit zwischen zwei „größer werden“ beim Laden (s)\n\n// Entladen: wie bisher (träger)\nconst AUX_P_DELTA_MAX_DIS_W = 80;  // max. Änderung pro Tick beim Entladen (W)\nconst RAMP_MIN_HOLD_DIS_S   = 30;  // min. Zeit zwischen zwei „größer werden“ beim Entladen (s)\n\n\n// -------------------------\n// Freigaben / Key-Namen\n// -------------------------\n\n// Global-Variablen (Freigaben)\nconst GLOBAL_KEY_AUX_CHG_EN = \"OstWest_Freigabe_Akku_Autom_Laden\";    // bool, Auto-Laden Akku 2 erlaubt\nconst GLOBAL_KEY_AUX_DIS_EN = \"OstWest_Freigabe_Akku_Autom_Entladen\"; // bool, Auto-Entladen Akku 2 erlaubt\n\n// Flow-Variablen (Konfiguration / Messwerte)\nconst FLOW_KEY_SOC_AUX_MIN        = \"OstWest_Akku_min_SoC\";           // min. SoC für Entladen Akku 2 (%, Fallback 5)\nconst FLOW_KEY_AUX_LIMIT_FULL_EN  = \"OstWest_Akku_Limit_Charge_Full\"; // bool, Lade-Limit bei fast voll aktiv\nconst FLOW_KEY_AUX_MAX_CELL_V     = \"byd_1-olli_mVoltMax\";            // max. Zellspannung in V (3 Nachkommastellen)\n\n\n// -------------------------\n// Zustände\n// -------------------------\n\nconst STATE_IDLE        = \"IDLE\";        // Kein spezieller Lade-/Entlademodus aktiv\nconst STATE_CHG_SURPLUS = \"CHG_SURPLUS\"; // PV-Überschuss: Akku 2 lädt (träge, kumuliert)\nconst STATE_DIS_BASE    = \"DIS_BASE\";    // Grundlast decken / Support: Akku 2 entlädt\nconst STATE_FREEZE      = \"FREEZE\";      // Failsafe / Fehlerzustand – kein aktives Laden/Entladen\n\n// DIS_BASE-Modus: Unterscheidung nach Auslöser\nconst DIS_MODE_GRID     = \"GRID\";        // DIS_BASE wegen Netzbezug\nconst DIS_MODE_SUPPORT  = \"SUPPORT\";     // DIS_BASE, um Hauptakku bei Entladung zu unterstützen\n\n\n// -------------------------\n// Hilfsfunktionen\n// -------------------------\n\nfunction clamp(value, min, max) {\n    return Math.min(max, Math.max(min, value));\n}\n\nfunction isFiniteNumber(v) {\n    return typeof v === \"number\" && isFinite(v);\n}\n\n\n// ------------------------------------------------------\n// 1) Werte aus global/flow holen\n// ------------------------------------------------------\n\nconst P_grid_raw = global.get(\"200.40097_W\");  // Leistung am Netzverknüpfungspunkt (+Bezug, -Einspeisung)\n\nconst SoC_main   = Number(global.get(\"BYD_SoC\"));    // SoC Hauptakku in %\nconst SoC_aux    = Number(global.get(\"BYD7.7_SoC\")); // SoC Akku 2 in %\n\nconst P_main_chg = Number(global.get(\"GEN24-8.0_Akku_Laden_W\")    || 0); // Hauptakku-Ladeleistung\nconst P_main_dis = Number(global.get(\"GEN24-8.0_Akku_Entladen_W\") || 0); // Hauptakku-Entladeleistung\n\nconst P_aux_chg  = Number(global.get(\"GEN24-3.0_Akku_Laden_W\")    || 0); // Akku 2 - Ladeleistung\nconst P_aux_dis  = Number(global.get(\"GEN24-3.0_Akku_Entladen_W\") || 0); // Akku 2 - Entladeleistung\n\nlet P_house      = global.get(\"Hausverbrauch_W\"); // Hausverbrauch (falls vorhanden)\n\nconst auxChargeEnable    = !!global.get(GLOBAL_KEY_AUX_CHG_EN);\nconst auxDischargeEnable = !!global.get(GLOBAL_KEY_AUX_DIS_EN);\n\nlet P_grid = Number(P_grid_raw);\nif (!isFiniteNumber(P_grid))  P_grid  = 0;\nif (!isFiniteNumber(P_house)) P_house = NaN;\n\n// Min-SoC Akku 2 aus Flow (Fallback 5 %)\nlet socAuxMinCfg          = Number(flow.get(FLOW_KEY_SOC_AUX_MIN));\nlet SOC_AUX_MIN_DISCHARGE = isFiniteNumber(socAuxMinCfg) ? socAuxMinCfg : SOC_AUX_MIN_DISCHARGE_DEFAULT;\n\n// Voll-Limit-Logik aus Flow\nconst auxLimitFullEnable = !!flow.get(FLOW_KEY_AUX_LIMIT_FULL_EN);\n\n// Wert kommt in V (z.B. 3.428)\nlet auxCellMaxV = Number(flow.get(FLOW_KEY_AUX_MAX_CELL_V));\nif (!isFiniteNumber(auxCellMaxV) || auxCellMaxV <= 0) {\n    auxCellMaxV = NaN;\n}\n\n// Effektiver Max-Charge-Limit (dynamisch)\nlet effectiveMaxChargeW = MAX_CHG_POWER_W;\nlet chargeLimitActive   = false;\n\nif (auxLimitFullEnable && isFiniteNumber(auxCellMaxV) && auxCellMaxV >= AUX_MAX_CELL_V) {\n    effectiveMaxChargeW = Math.min(MAX_CHG_POWER_W, AUX_MAX_CHARGE_FULL_W);\n    chargeLimitActive   = true;\n}\n\n\n// ------------------------------------------------------\n// 2) Failsafe\n// ------------------------------------------------------\n\nlet failsafeReason = null;\n\nif (FAILSAFE_ACTIVE) {\n    if (!isFiniteNumber(P_grid_raw))     failsafeReason = \"P_grid invalid\";\n    else if (!isFiniteNumber(SoC_main))  failsafeReason = \"SoC_main invalid\";\n    else if (!isFiniteNumber(SoC_aux))   failsafeReason = \"SoC_aux invalid\";\n}\n\n\n// ------------------------------------------------------\n// 3) State & Zeitkontexte laden\n// ------------------------------------------------------\n\nconst now = Date.now();\n\nlet state             = context.get(\"state\")             || STATE_IDLE;\nlet lastStateTs       = context.get(\"lastStateTs\")       || now;\nlet lastPset          = context.get(\"P_set_aux\")         || 0;\nlet disMode           = context.get(\"disMode\")           || DIS_MODE_GRID;\nlet importHighSince   = context.get(\"importHighSince\")   || 0;\nlet exportHighSince   = context.get(\"exportHighSince\")   || 0;\nlet wasImportHigh     = context.get(\"wasImportHigh\")     || false;\nlet wasExportHigh     = context.get(\"wasExportHigh\")     || false;\nlet importStopSince   = context.get(\"importStopSince\")   || 0;\nlet wasImportStop     = context.get(\"wasImportStop\")     || false;\nlet lastRampTs        = context.get(\"lastRampTs\")        || now;\nlet lastSupportTarget = context.get(\"lastSupportTarget\") || 0;\n\nconst isGridImport = (P_grid >  (GRID_IMPORT_MIN_W + GRID_TOLERANCE_W));\nconst isGridExport = (P_grid < -(GRID_EXPORT_MIN_W + GRID_TOLERANCE_W));\n\n// Import-Delay-Tracking (für DIS_START_DELAY_S)\nif (isGridImport) {\n    if (!wasImportHigh) {\n        importHighSince = now;\n        wasImportHigh   = true;\n    }\n} else {\n    importHighSince = 0;\n    wasImportHigh   = false;\n}\nconst tGridImportHigh = importHighSince ? (now - importHighSince) / 1000 : 0;\n\n// Export-Delay-Tracking (für CHG_START_DELAY_S)\nif (isGridExport) {\n    if (!wasExportHigh) {\n        exportHighSince = now;\n        wasExportHigh   = true;\n    }\n} else {\n    exportHighSince = 0;\n    wasExportHigh   = false;\n}\nconst tGridExportHigh = exportHighSince ? (now - exportHighSince) / 1000 : 0;\n\n// „kleiner Import“ / 0 W → wann stoppen wir CHG_SURPLUS?\nconst isSmallImport = (P_grid >= 0);\n\nif (isSmallImport) {\n    if (!wasImportStop) {\n        importStopSince = now;\n        wasImportStop   = true;\n    }\n} else {\n    importStopSince = 0;\n    wasImportStop   = false;\n}\nconst tImportStop = importStopSince ? (now - importStopSince) / 1000 : 0;\n\n// State-Haltezeit\nconst tStateHold = (now - lastStateTs) / 1000;\n\n\n// ------------------------------------------------------\n// 4) Failsafe-Übergang in FREEZE\n// ------------------------------------------------------\n\nif (failsafeReason && state !== STATE_FREEZE) {\n    state       = STATE_FREEZE;\n    lastStateTs = now;\n}\n\n\n// ------------------------------------------------------\n// 5) State-Machine\n// ------------------------------------------------------\n\nlet nextState = state;\n\nif (state === STATE_FREEZE) {\n\n    if (!failsafeReason && tStateHold >= MIN_STATE_HOLD_TIME_S) {\n        nextState   = STATE_IDLE;\n        lastStateTs = now;\n    }\n\n} else {\n\n    const allowTransition = (tStateHold >= MIN_STATE_HOLD_TIME_S);\n\n    if (failsafeReason) {\n        nextState   = STATE_FREEZE;\n        lastStateTs = now;\n\n    } else if (allowTransition) {\n\n        switch (state) {\n\n            case STATE_IDLE: {\n                const wasChargingBefore = (lastPset > 0); // Laden = positiver Wert\n\n                // Laden aus Überschuss (CHG_SURPLUS)\n                if (auxChargeEnable &&\n                    SoC_main >= SOC_MAIN_MIN_FOR_AUX_CHARGE &&\n                    P_main_dis <= MAIN_DISCHARGE_WEAK_W &&\n                    isGridExport &&\n                    P_main_dis <= MAIN_DISCHARGE_STRONG_W) {\n\n                    if (wasChargingBefore || tGridExportHigh >= CHG_START_DELAY_S) {\n                        nextState   = STATE_CHG_SURPLUS;\n                        lastStateTs = now;\n                    }\n                }\n                // Grundlast entladen bei Netzbezug (DIS_BASE, GRID-Modus)\n                else if (auxDischargeEnable &&\n                         SoC_aux > SOC_AUX_MIN_DISCHARGE &&\n                         isGridImport &&\n                         tGridImportHigh >= DIS_START_DELAY_S) {\n\n                    nextState   = STATE_DIS_BASE;\n                    disMode     = DIS_MODE_GRID;\n                    context.set(\"disMode\", disMode);\n                    lastStateTs = now;\n                }\n                // Hauptakku-Support (DIS_BASE, SUPPORT-Modus)\n                else if (auxDischargeEnable &&\n                         SoC_aux > SOC_AUX_MIN_DISCHARGE &&\n                         P_main_dis >= MAIN_DIS_SUPPORT_ENTRY_W) {\n\n                    nextState   = STATE_DIS_BASE;\n                    disMode     = DIS_MODE_SUPPORT;\n                    context.set(\"disMode\", disMode);\n                    lastStateTs = now;\n                }\n                break;\n            }\n\n            case STATE_CHG_SURPLUS: {\n                // Nur aus CHG_SURPLUS raus, wenn wir wirklich „fertig“ sind:\n                // länger Import/kein Überschuss UND bereits auf 0W runtergeregelt\n                const importStopCond =\n                    (P_grid >= 0 &&\n                     tImportStop >= CHG_STOP_IMPORT_DELAY_S &&\n                     lastPset === 0);\n\n                if (!auxChargeEnable ||\n                    SoC_main < SOC_MAIN_MIN_FOR_AUX_CHARGE ||\n                    importStopCond ||\n                    P_main_dis > MAIN_DISCHARGE_STRONG_W) {\n\n                    nextState   = STATE_IDLE;\n                    lastStateTs = now;\n                }\n                break;\n            }\n\n            case STATE_DIS_BASE: {\n                let exit = false;\n\n                if (!auxDischargeEnable || SoC_aux <= SOC_AUX_MIN_DISCHARGE) {\n                    exit = true;\n                } else if (disMode === DIS_MODE_GRID) {\n                    if (P_grid <= 0) exit = true;\n                } else if (disMode === DIS_MODE_SUPPORT) {\n                    if (P_main_dis < MAIN_DIS_SUPPORT_EXIT_W) exit = true;\n                }\n\n                if (exit) {\n                    nextState         = STATE_IDLE;\n                    disMode           = DIS_MODE_GRID;\n                    lastSupportTarget = 0;\n                    context.set(\"disMode\", disMode);\n                    context.set(\"lastSupportTarget\", lastSupportTarget);\n                    lastStateTs = now;\n                }\n                break;\n            }\n        }\n    }\n}\n\n\n// ------------------------------------------------------\n// 6) P_set_aux je nach nextState (Watt)\n// ------------------------------------------------------\n//\n// P_set_aux > 0  → Akku 2 LADEN\n// P_set_aux < 0  → Akku 2 ENTlädt\n// ------------------------------------------------------\n\nlet P_set_aux_new = 0;\n\nif (nextState === STATE_CHG_SURPLUS && !failsafeReason) {\n\n    // Laden dynamisch an P_grid anpassen:\n    // - Export  → positiv (mehr laden)\n    // - Import  → negativ (Ladeleistung reduzieren)\n    // - nahe 0  → keine Änderung\n    let P_surplus = 0;\n\n    if (P_grid < -GRID_TOLERANCE_W) {\n        // Export: wir können mehr laden\n        P_surplus = -P_grid;            // z.B. Pg=-500 → +500W „mehr laden“\n    } else if (P_grid > GRID_TOLERANCE_W) {\n        // Import: zu viel geladen → wieder etwas runter\n        P_surplus = -P_grid;            // z.B. Pg=+200 → -200W „weniger laden“\n    } else {\n        // in der Nähe von 0W → nichts tun\n        P_surplus = 0;\n    }\n\n    // Ziel = bisherige Ladeleistung + Korrektur\n    let P_target = P_aux_chg + P_surplus;\n\n    // Niemals ins Entladen kippen\n    if (P_target < 0) P_target = 0;\n\n    // Begrenzen auf WR-Grenze, Basislimit und ggf. „Akku fast voll“-Limit:\n    P_target      = Math.min(P_target, AUX_WR_AC_MAX_W, effectiveMaxChargeW);\n    P_set_aux_new = P_target;  // positiv = Laden\n\n} else if (nextState === STATE_DIS_BASE && !failsafeReason) {\n\n    if (disMode === DIS_MODE_GRID) {\n\n        let P_base_need;\n        if (isFiniteNumber(P_house) && P_house > 0) {\n            P_base_need = Math.min(P_house, BASELOAD_TARGET_W);\n        } else {\n            P_base_need = Math.min(Math.max(P_grid, 0), BASELOAD_TARGET_W);\n        }\n\n        let target    = Math.min(P_base_need, BASELOAD_TARGET_W, AUX_WR_AC_MAX_W);\n        P_set_aux_new = -Math.max(0, Math.round(target));  // negativ = Entladen\n\n    } else if (disMode === DIS_MODE_SUPPORT) {\n\n        const P_main_dis_pos = Math.max(0, P_main_dis);\n\n        let P_aux_target_raw = 0;\n        if (MAIN_TO_AUX_CAP_RATIO > 0) {\n            P_aux_target_raw = P_main_dis_pos / MAIN_TO_AUX_CAP_RATIO;\n        }\n\n        let P_aux_target = Math.min(P_aux_target_raw, AUX_WR_AC_MAX_W);\n\n        if (SUPPORT_STEP_W > 0) {\n            P_aux_target = Math.round(P_aux_target / SUPPORT_STEP_W) * SUPPORT_STEP_W;\n        }\n\n        if (lastSupportTarget > 0 && P_aux_target > 0) {\n            if (Math.abs(P_aux_target - lastSupportTarget) < SUPPORT_TARGET_HYST_W) {\n                P_aux_target = lastSupportTarget;\n            }\n        }\n\n        if (P_aux_target < SUPPORT_STEP_W) {\n            P_set_aux_new    = 0;\n            lastSupportTarget = 0;\n        } else {\n            P_set_aux_new     = -P_aux_target;\n            lastSupportTarget = P_aux_target;\n        }\n\n        context.set(\"lastSupportTarget\", lastSupportTarget);\n    }\n\n} else {\n    P_set_aux_new    = 0;\n    lastSupportTarget = 0;\n    context.set(\"lastSupportTarget\", lastSupportTarget);\n}\n\n\n// ------------------------------------------------------\n// 7) Rampe (getrennt für Laden / Entladen)\n// ------------------------------------------------------\n\nlet P_set_aux;\n\nconst dtRamp        = (now - lastRampTs) / 1000;\nconst isSupportMode = (nextState === STATE_DIS_BASE && disMode === DIS_MODE_SUPPORT);\n\nconst magOld        = Math.abs(lastPset);\nconst magNew        = Math.abs(P_set_aux_new);\n\nconst magnitudeIncreases = (magNew > magOld);\n\nlet holdMagnitude   = false;\n\n// Welcher Rampen-Satz?\nconst isCharging    = (P_set_aux_new > 0);\nconst isDischarging = (P_set_aux_new < 0);\n\n// min. Haltezeit und max. Delta je nach Richtung\nconst rampHoldMinS  = isCharging ? RAMP_MIN_HOLD_CHG_S  : RAMP_MIN_HOLD_DIS_S;\nconst rampDeltaMaxW = isCharging ? AUX_P_DELTA_MAX_CHG_W: AUX_P_DELTA_MAX_DIS_W;\n\nif (isDischarging && isSupportMode) {\n    // Support-Modus: wie bisher „träger“\n    const magnitudeChanged = (magNew !== magOld);\n    if (P_set_aux_new !== 0 && magnitudeChanged && dtRamp < rampHoldMinS) {\n        holdMagnitude = true;\n    }\n} else {\n    // Standard: bei größerer Stellgröße nur alle rampHoldMinS hochfahren\n    if (magnitudeIncreases && dtRamp < rampHoldMinS) {\n        holdMagnitude = true;\n    }\n}\n\nif (holdMagnitude) {\n    P_set_aux = lastPset;\n} else {\n    const delta = P_set_aux_new - lastPset;\n\n    if (Math.abs(delta) > rampDeltaMaxW) {\n        P_set_aux = lastPset + Math.sign(delta) * rampDeltaMaxW;\n    } else {\n        P_set_aux = P_set_aux_new;\n    }\n\n    if (P_set_aux !== lastPset) {\n        lastRampTs = now;\n    }\n}\n\nP_set_aux = clamp(P_set_aux, -AUX_WR_AC_MAX_W, AUX_WR_AC_MAX_W);\nif (Math.abs(P_set_aux) < 10) P_set_aux = 0;\nP_set_aux = Math.round(P_set_aux);\n\n\n// ------------------------------------------------------\n// 8) Node-Status + Debug\n// ------------------------------------------------------\n\nlet dbgState = nextState;\nif (nextState === STATE_DIS_BASE) {\n    dbgState = (disMode === DIS_MODE_SUPPORT) ? \"DIS_SUPPORT\" : \"DIS_GRID\";\n}\n\nlet freeStr = \"F:\";\nif (auxChargeEnable && auxDischargeEnable) freeStr += \"LD\";\nelse if (auxChargeEnable)                 freeStr += \"L\";\nelse if (auxDischargeEnable)              freeStr += \"D\";\nelse                                      freeStr += \"-\";\n\nconst dbg = {\n    state:              dbgState,\n    stateBase:          nextState,\n    disMode,\n    failsafeReason:     failsafeReason || null,\n    P_grid,\n    P_house,\n    SoC_main,\n    SoC_aux,\n    socAuxMinDischarge: SOC_AUX_MIN_DISCHARGE,\n    P_main_chg,\n    P_main_dis,\n    P_aux_chg,\n    P_aux_dis,\n    auxChargeEnable,\n    auxDischargeEnable,\n    tGridImportHigh,\n    tGridExportHigh,\n    tImportStop,\n    tStateHold,\n    P_set_aux,\n    lastSupportTarget,\n    chargeLimitActive,\n    auxLimitFullEnable,\n    auxCellMaxV,\n    effectiveMaxChargeW\n};\n\nlet statusColor = \"grey\";\nlet statusText  = \"\";\n\nswitch (nextState) {\n    case STATE_IDLE:\n        statusColor = \"grey\";\n        statusText  = `IDLE ${freeStr} P=${P_set_aux.toFixed(0)}W Pg=${P_grid.toFixed(0)}W`;\n        break;\n\n    case STATE_CHG_SURPLUS:\n        statusColor = \"green\";\n        statusText  = `CHG${chargeLimitActive ? \" (LIM)\" : \"\"} ${freeStr} ` +\n                      `P=${P_set_aux.toFixed(0)}W Pg=${P_grid.toFixed(0)}W SoC_main=${SoC_main}%`;\n        break;\n\n    case STATE_DIS_BASE:\n        if (disMode === DIS_MODE_GRID) {\n            statusColor = \"yellow\";\n            statusText  = `DIS_GRID ${freeStr} P=${P_set_aux.toFixed(0)}W Pg=${P_grid.toFixed(0)}W SoC_aux=${SoC_aux}%`;\n        } else {\n            statusColor = \"orange\";\n            statusText  = `DIS_SUPPORT ${freeStr} P=${P_set_aux.toFixed(0)}W Pg=${P_grid.toFixed(0)}W SoC_aux=${SoC_aux}%`;\n        }\n        break;\n\n    case STATE_FREEZE:\n        statusColor = \"red\";\n        statusText  = `FREEZE ${freeStr} ${failsafeReason || \"\"}`;\n        break;\n}\n\nnode.status({ fill: statusColor, shape: \"dot\", text: statusText });\n\n\n// ------------------------------------------------------\n// 9) Kontext aktualisieren\n// ------------------------------------------------------\n\ncontext.set(\"state\",             nextState);\ncontext.set(\"lastStateTs\",       lastStateTs);\ncontext.set(\"P_set_aux\",         P_set_aux);\ncontext.set(\"importHighSince\",   importHighSince);\ncontext.set(\"exportHighSince\",   exportHighSince);\ncontext.set(\"wasImportHigh\",     wasImportHigh);\ncontext.set(\"wasExportHigh\",     wasExportHigh);\ncontext.set(\"disMode\",           disMode);\ncontext.set(\"importStopSince\",   importStopSince);\ncontext.set(\"wasImportStop\",     wasImportStop);\ncontext.set(\"lastRampTs\",        lastRampTs);\ncontext.set(\"lastSupportTarget\", lastSupportTarget);\n\n\n// ------------------------------------------------------\n// 10) SBC-Logik für P_set_aux (mit Deadband)\n// ------------------------------------------------------\n\nconst lastOutP = context.get(\"lastOutP\");\nlet msgP   = null;\nlet msgDbg = null;\n\n// Zusatzbedingungen:\nconst firstRun     = (lastOutP === undefined);\nconst diff         = firstRun ? Infinity : Math.abs(P_set_aux - lastOutP);\nconst crossedZero  = !firstRun && (P_set_aux === 0 && lastOutP !== 0);\nconst signChanged  = !firstRun && (Math.sign(P_set_aux) !== Math.sign(lastOutP));\n\nif (\n    firstRun ||\n    diff >= P_SET_DEADBAND_W ||\n    crossedZero ||          // immer senden, wenn wir auf 0 gehen\n    signChanged             // immer senden bei Wechsel Laden ↔ Entladen\n) {\n    msgP = { payload: P_set_aux };\n    context.set(\"lastOutP\", P_set_aux);\n}\n\n// Debug SBC\nconst lastDbgJson = context.get(\"lastDbgJson\");\nconst dbgJson     = JSON.stringify(dbg);\n\nif (dbgJson !== lastDbgJson) {\n    msgDbg = { payload: dbg };\n    context.set(\"lastDbgJson\", dbgJson);\n}\n\nreturn [msgP, msgDbg];",
+    "outputs": 2,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 410,
+    "y": 240,
+    "wires": [
+      [
+        "4e1e789e9d2596fa",
+        "2840a440d760afd1"
+      ],
+      [
+        "94da46bb600a0c5e",
+        "fa4b06952e2cca38"
+      ]
+    ]
+  },
+  {
+    "id": "b6c4d9d1f96d29ec",
+    "type": "debug",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "Out",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "payload",
+    "statusType": "auto",
+    "x": 1190,
+    "y": 360,
+    "wires": []
+  },
+  {
+    "id": "16f2f10796b2f552",
+    "type": "debug",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "In",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "payload",
+    "statusType": "auto",
+    "x": 1190,
+    "y": 220,
+    "wires": []
+  },
+  {
+    "id": "94da46bb600a0c5e",
+    "type": "debug",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "Debug",
+    "active": false,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "payload",
+    "statusType": "auto",
+    "x": 730,
+    "y": 160,
+    "wires": []
+  },
+  {
+    "id": "eac9915a7c1746ad",
+    "type": "inject",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "Alle 3 sekunden",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "3",
+    "crontab": "",
+    "once": true,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "true",
+    "payloadType": "bool",
+    "x": 170,
+    "y": 240,
+    "wires": [
+      [
+        "5032abb032dce2ab"
+      ]
+    ]
+  },
+  {
+    "id": "e50c30692daafeb0",
+    "type": "function",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "globalSet - \"OstWest_Freigabe_Akku_Autom_Laden\"",
+    "func": "global.set(\"OstWest_Freigabe_Akku_Autom_Laden\", msg.payload);\nnode.status({ fill: \"blue\", shape: \"dot\", text: msg.payload });\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 620,
+    "y": 60,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "69abf3d69c93f64e",
+    "type": "function",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "globalSet - \"OstWest_Freigabe_Akku_Autom_Entladen\"",
+    "func": "global.set(\"OstWest_Freigabe_Akku_Autom_Entladen\", msg.payload);\nnode.status({ fill: \"blue\", shape: \"dot\", text: msg.payload });\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 630,
+    "y": 120,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "2e6484630f7f6c2a",
+    "type": "ioBroker in",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "OstWest_Freigabe_Akku_Autom_Entladen",
+    "attrname": "",
+    "topic": "gira-endpoint.0.CO@.OstWest_Freigabe_Akku_Autom_Entladen.value",
+    "payloadType": "value",
+    "onlyack": "",
+    "func": "all",
+    "gap": "",
+    "fireOnStart": "true",
+    "outFormat": "MQTT",
+    "x": 220,
+    "y": 120,
+    "wires": [
+      [
+        "69abf3d69c93f64e"
+      ]
+    ],
+    "icon": "node-red-contrib-knx-ultimate/node-knx-icon.svg"
+  },
+  {
+    "id": "b2ca0bbb9263d670",
+    "type": "ioBroker in",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "OstWest_Freigabe_Akku_Autom_Laden",
+    "attrname": "",
+    "topic": "gira-endpoint.0.CO@.OstWest_Freigabe_Akku_Autom_Laden.value",
+    "payloadType": "value",
+    "onlyack": "",
+    "func": "all",
+    "gap": "",
+    "fireOnStart": "true",
+    "outFormat": "MQTT",
+    "x": 210,
+    "y": 60,
+    "wires": [
+      [
+        "e50c30692daafeb0"
+      ]
+    ],
+    "icon": "node-red-contrib-knx-ultimate/node-knx-icon.svg"
+  },
+  {
+    "id": "fa4b06952e2cca38",
+    "type": "function",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "Visu Status Text",
+    "func": "// Helfer-Funktion:\n// Nimmt das Debug-Objekt (3. Ausgang der BYD2-Steuerung) in msg.payload\n// und erzeugt daraus einen Visu-String.\n// Ausgabe ist SBC (sendByChange): nur senden, wenn sich der Text geändert hat.\n\n// -------------------------\n// Konfiguration: Welche Felder, wie anzeigen?\n// -------------------------\n//\n// label  = Text vor dem Wert\n// key    = Feldname im Debug-Objekt (z.B. state, P_set_aux, P_grid, SoC_main ...)\n// unit   = optionale Einheit\n// digits = Nachkommastellen für Zahlen (optional, default: keine Formatierung)\n//\n// Debug-Objekt hat z.B.:\n// {\n//   state, failsafeReason, P_grid, P_house, SoC_main, SoC_aux,\n//   P_main_chg, P_main_dis, P_aux_chg, P_aux_dis,\n//   auxChargeEnable, auxDischargeEnable,\n//   tGridImportHigh, tGridExportHigh, tStateHold,\n//   P_set_aux, InWRte, OutWRte\n// }\n\nconst FIELDS = [\n    { label: \"Mode\",     key: \"state\" },\n    { label: \"Akku\",  key: \"P_set_aux\",     unit: \"W\",  digits: 0 },\n    // Beispiel für Freigaben:\n    // { label: \"Laden EN\",   key: \"auxChargeEnable\" },\n    // { label: \"Entl EN\",    key: \"auxDischargeEnable\" }\n];\n\n// Trennzeichen zwischen den Paaren\nconst SEPARATOR = \" | \";\n\n// -------------------------\n// Ab hier nichts mehr ändern nötig\n// -------------------------\n\nconst dbg = msg && msg.payload ? msg.payload : {};\n\nif (typeof dbg !== \"object\" || dbg === null || Array.isArray(dbg)) {\n    // Kein valides Debug-Objekt → nichts senden\n    return null;\n}\n\nconst parts = [];\n\nfor (const f of FIELDS) {\n    if (!f || !f.key) continue;\n\n    let v = dbg[f.key];\n\n    // Nur ausgeben, wenn vorhanden und nicht undefined/null\n    if (v === undefined || v === null) continue;\n\n    // Zahlen formatieren\n    if (typeof v === \"number\" && isFinite(v) && typeof f.digits === \"number\") {\n        v = v.toFixed(f.digits);\n    }\n\n    // Booleans hübscher\n    if (typeof v === \"boolean\") {\n        v = v ? \"1\" : \"0\";\n    }\n\n    const unit  = f.unit ? f.unit : \"\";\n    const label = f.label || f.key;\n\n    parts.push(`${label}=${v}${unit}`);\n}\n\nconst text = parts.join(SEPARATOR);\n\n// SBC: nur senden, wenn sich der Text geändert hat\nconst lastText = context.get(\"lastText\");\nif (text === lastText) {\n    // nix Neues → kein Output\n    return null;\n}\n\ncontext.set(\"lastText\", text);\n\n// msg.payload = Visu-String\nmsg.payload = text;\n\n// optional Node-Status setzen\nnode.status({\n    fill:  \"blue\",\n    shape: \"dot\",\n    text:  text\n});\n\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1200,
+    "y": 160,
+    "wires": [
+      [
+        "c2a1831936ef2858"
+      ]
+    ]
+  },
+  {
+    "id": "c2a1831936ef2858",
+    "type": "function",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "OstWest_Funktion_Status_txt",
+    "func": "var co = \"OstWest_Funktion_Status_txt\";\n\nvar jsonMsg = {\n    \"type\": \"call\",\n    \"param\": {\n        \"key\": \"CO@\" + co,\n        \"method\": \"set\",\n        \"encoding\": \"ascci\",\n        \"value\": `${msg.payload}`\n    }\n};\nnode.status({ fill: \"green\", shape: \"dot\", text: \"CO@\" + co + \" -> \" + msg.payload });\n\nmsg.payload = jsonMsg;\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1450,
+    "y": 160,
+    "wires": [
+      [
+        "6c5b9ddb190fa84a"
+      ]
+    ]
+  },
+  {
+    "id": "2840a440d760afd1",
+    "type": "function",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "DIE Ausgangs Logik V2",
+    "func": "// Node-RED Function: BYD2 Ausgangslogik (optimiert mit richtiger Reihenfolge)\n// Input:  msg.payload = P_set_aux (W), >0 = Laden, <0 = Entladen\n// Output 0: InWRte  (%), SBC\n// Output 1: OutWRte (%), SBC\n//\n// BYD-Logik:\n//  - Laden erzwingen:    OutWRte < 0, InWRte > 0, In ≥ |Out|\n//  - Entladen erzwingen: InWRte  < 0, OutWRte > 0, Out ≥ |In|\n//\n// Wir setzen:\n//  - Laden:    In = +X, Out = -X\n//  - Entladen: Out = +X, In = -X\n//\n// Reihenfolge bei Änderung (gleicher Modus):\n//  - CHG hoch:    zuerst In+, dann Out−\n//  - CHG runter:  zuerst Out−, dann In+\n//  - DIS hoch:    zuerst Out+, dann In−\n//  - DIS runter:  zuerst In−, dann Out+\n//\n// Bei Soll = 0: erst das bisher negative Register auf 0, dann das positive mit Delay.\n\n\n// -------------------------\n// Konfiguration\n// -------------------------\n\nconst AUX_BAT_MAX_W = 7680;   // Setpoint max charge (für %-Berechnung)\nconst NEG_DELAY_MS  = 500;    // Verzögerung für \"zweite\" Nachricht (ms)\n\n\n// Hilfsfunktionen\nfunction clamp(value, min, max) {\n    return Math.min(max, Math.max(min, value));\n}\n\nfunction isFiniteNumber(v) {\n    return typeof v === \"number\" && isFinite(v);\n}\n\nfunction round1(x) {\n    return Number(x.toFixed(1));   // 1 Nachkommastelle\n}\n\n\n// ------------------------------------------------------\n// 1) P_set_aux aus msg.payload lesen\n// ------------------------------------------------------\n\nlet P_set_aux = Number(msg.payload);\nif (!isFiniteNumber(P_set_aux)) {\n    P_set_aux = 0;\n}\n\n// kleine Werte auf 0 (Hysterese gegen Flattern)\nif (Math.abs(P_set_aux) < 10) {\n    P_set_aux = 0;\n}\n\n\n// ------------------------------------------------------\n// 2) Kontext: letzte Werte\n// ------------------------------------------------------\n\nconst prevInWRte  = Number(context.get(\"lastInWRte\")  || 0);\nconst prevOutWRte = Number(context.get(\"lastOutWRte\") || 0);\n\n// alten Modus + alte Magnitude ermitteln (für Reihenfolge-Logik)\nlet prevMode = \"NEUTRAL\";  // NEUTRAL | CHG | DIS\nlet prevMag  = 0;\n\nif (prevInWRte < 0 && prevOutWRte >= 0) {\n    // Entladen erzwingen aktiv\n    prevMode = \"DIS\";\n    prevMag  = Math.max(Math.abs(prevInWRte), Math.abs(prevOutWRte));\n} else if (prevOutWRte < 0 && prevInWRte >= 0) {\n    // Laden erzwingen aktiv\n    prevMode = \"CHG\";\n    prevMag  = Math.max(Math.abs(prevOutWRte), Math.abs(prevInWRte));\n}\n\n\n// ------------------------------------------------------\n// 3) Sonderfall: Soll = 0 → geordnete 0-Sequenz\n// ------------------------------------------------------\n//\n// Ziel: WR sauber aus \"erzwingen\"-Modus holen.\n// - Wenn ein Register negativ war, zuerst dieses Register auf 0 (ohne Delay),\n//   dann das jeweils andere (positive) mit Delay.\n// - Wenn nichts negativ, einfach beide ggf. auf 0 setzen.\n//\n\nif (P_set_aux === 0) {\n    let msgIn  = null;\n    let msgOut = null;\n\n    if (prevInWRte !== 0 || prevOutWRte !== 0) {\n\n        // Fall A: In war negativ (DIS aktiv)\n        if (prevInWRte < 0) {\n            if (prevInWRte !== 0) {\n                msgIn = { payload: 0 };\n                context.set(\"lastInWRte\", 0);\n            }\n            if (prevOutWRte !== 0) {\n                msgOut = { payload: 0, delay: NEG_DELAY_MS };\n                context.set(\"lastOutWRte\", 0);\n            }\n        }\n        // Fall B: Out war negativ (CHG aktiv)\n        else if (prevOutWRte < 0) {\n            if (prevOutWRte !== 0) {\n                msgOut = { payload: 0 };\n                context.set(\"lastOutWRte\", 0);\n            }\n            if (prevInWRte !== 0) {\n                msgIn = { payload: 0, delay: NEG_DELAY_MS };\n                context.set(\"lastInWRte\", 0);\n            }\n        }\n        // Fall C: keins war negativ (Startzustand / nur positive Werte)\n        else {\n            if (prevInWRte !== 0) {\n                msgIn = { payload: 0 };\n                context.set(\"lastInWRte\", 0);\n            }\n            if (prevOutWRte !== 0) {\n                msgOut = { payload: 0 };\n                context.set(\"lastOutWRte\", 0);\n            }\n        }\n    }\n\n    node.status({\n        fill:  \"blue\",\n        shape: \"dot\",\n        text:  `P=0W  In=0.0%  Out=0.0%`\n    });\n\n    return [msgIn, msgOut];\n}\n\n\n// ------------------------------------------------------\n// 4) Modus + Betrag (in %) aus P_set_aux ableiten (für ≠ 0)\n// ------------------------------------------------------\n//\n// P_set_aux > 0  → CHG (Laden erzwingen)\n// P_set_aux < 0  → DIS (Entladen erzwingen)\n// ------------------------------------------------------\n\nlet desiredMode = \"NEUTRAL\"; // NEUTRAL | CHG | DIS\nlet desiredMag  = 0;         // Betrag in %\n\n{\n    let pct = (P_set_aux / AUX_BAT_MAX_W) * 100;\n    pct = clamp(pct, -100, 100);\n    pct = round1(pct);  // 0,1 %\n\n    const mag = Math.min(100, Math.abs(pct));\n\n    if (mag > 0.05) {\n        desiredMag = round1(mag);\n        if (pct > 0) {\n            desiredMode = \"CHG\";   // >0 = Laden\n        } else {\n            desiredMode = \"DIS\";   // <0 = Entladen\n        }\n    } else {\n        desiredMode = \"NEUTRAL\";\n    }\n}\n\n// Sicherheits-Fallback: wenn aus irgendeinem Grund NEUTRAL → wie Soll=0 behandeln\nif (desiredMode === \"NEUTRAL\" || desiredMag === 0) {\n    // auf Nummer sicher: alles auf 0\n    let msgIn  = null;\n    let msgOut = null;\n\n    if (prevInWRte !== 0) {\n        msgIn = { payload: 0 };\n        context.set(\"lastInWRte\", 0);\n    }\n    if (prevOutWRte !== 0) {\n        msgOut = { payload: 0 };\n        context.set(\"lastOutWRte\", 0);\n    }\n\n    node.status({\n        fill:  \"blue\",\n        shape: \"dot\",\n        text:  `P≈0W  In=0.0%  Out=0.0%`\n    });\n\n    return [msgIn, msgOut];\n}\n\n\n// ------------------------------------------------------\n// 5) InWRte / OutWRte berechnen (symmetrisch)\n// ------------------------------------------------------\n//\n// Laden:    In = +X, Out = -X\n// Entladen: Out = +X, In = -X\n// ------------------------------------------------------\n\nlet InWRte  = 0;\nlet OutWRte = 0;\n\nif (desiredMode === \"CHG\") {\n    InWRte  = desiredMag;\n    OutWRte = -desiredMag;\n} else if (desiredMode === \"DIS\") {\n    OutWRte = desiredMag;\n    InWRte  = -desiredMag;\n}\n\n// End-Rundung\nInWRte  = round1(InWRte);\nOutWRte = round1(OutWRte);\n\n// neue Magnitude (max. Betrag von In/Out)\nconst newMag = Math.max(Math.abs(InWRte), Math.abs(OutWRte));\n\n// Änderungstendenz ermitteln (mit kleiner Toleranz)\nconst MAG_EPS = 0.05;\nconst magDecreasing = (newMag + MAG_EPS < prevMag);\nconst magIncreasing = (newMag > prevMag + MAG_EPS);\n\n// ------------------------------------------------------\n// 6) SBC-Logik + Reihenfolge/Delay für CHG/DIS\n// ------------------------------------------------------\n//\n// Idee:\n//  - Wir senden max. eine Nachricht pro Register.\n//  - Reihenfolge wird über msg.delay (NEG_DELAY_MS) gesteuert.\n//  - Bei Leistungsänderungen im gleichen Modus:\n//\n//    CHG (Laden): In > 0, Out < 0\n//       - hoch:   zuerst In+, dann Out−\n//       - runter: zuerst Out−, dann In+\n//\n//    DIS (Entladen): In < 0, Out > 0\n//       - hoch:   zuerst Out+, dann In−\n//       - runter: zuerst In−, dann Out+\n//\n//  - Wenn Modus gewechselt hat (CHG <-> DIS), machen wir hier\n//    nichts Besonderes – deine Hauptlogik ramped ja über 0\n//    und wir haben oben eine Hysterese.\n// ------------------------------------------------------\n\nlet msgIn  = null;\nlet msgOut = null;\n\n// Falls sich nichts ändert → nichts senden\nif (InWRte === prevInWRte && OutWRte === prevOutWRte) {\n\n    node.status({\n        fill:  \"blue\",\n        shape: \"dot\",\n        text:  `P=${P_set_aux.toFixed(0)}W  In=${InWRte.toFixed(1)}%  Out=${OutWRte.toFixed(1)}%`\n    });\n\n    return [null, null];\n}\n\n// Hilfsfunktion: einfache „sofort senden“-Variante (z.B. bei Moduswechsel)\nfunction sendSimple() {\n    let mIn  = null;\n    let mOut = null;\n\n    if (InWRte !== prevInWRte) {\n        mIn = { payload: InWRte };\n        if (InWRte < 0) {\n            mIn.delay = NEG_DELAY_MS;\n        }\n        context.set(\"lastInWRte\", InWRte);\n    }\n\n    if (OutWRte !== prevOutWRte) {\n        mOut = { payload: OutWRte };\n        if (OutWRte < 0) {\n            mOut.delay = NEG_DELAY_MS;\n        }\n        context.set(\"lastOutWRte\", OutWRte);\n    }\n\n    return [mIn, mOut];\n}\n\n// Wenn der Modus wechselt (CHG <-> DIS), nehmen wir die einfache Variante.\n// (Optional könnte man hier noch einen Zwischen-0-Schritt erzwingen.)\nif (prevMode !== \"NEUTRAL\" && prevMode !== desiredMode) {\n    [msgIn, msgOut] = sendSimple();\n} else {\n\n    // Modus bleibt gleich → wir können fein differenzieren.\n    if (desiredMode === \"CHG\") {\n        // In > 0, Out < 0\n        if (magIncreasing) {\n            // CHG hoch: zuerst In+, dann Out−\n            if (InWRte !== prevInWRte) {\n                msgIn = { payload: InWRte };           // sofort\n                context.set(\"lastInWRte\", InWRte);\n            }\n            if (OutWRte !== prevOutWRte) {\n                msgOut = { payload: OutWRte, delay: NEG_DELAY_MS }; // verzögert (negativ)\n                context.set(\"lastOutWRte\", OutWRte);\n            }\n        } else if (magDecreasing) {\n            // CHG runter: zuerst Out−, dann In+\n            if (OutWRte !== prevOutWRte) {\n                msgOut = { payload: OutWRte };         // zuerst\n                context.set(\"lastOutWRte\", OutWRte);\n            }\n            if (InWRte !== prevInWRte) {\n                msgIn = { payload: InWRte, delay: NEG_DELAY_MS };   // dann\n                context.set(\"lastInWRte\", InWRte);\n            }\n        } else {\n            // Magnitude quasi gleich → einfache Variante\n            [msgIn, msgOut] = sendSimple();\n        }\n    } else if (desiredMode === \"DIS\") {\n        // Out > 0, In < 0\n        if (magIncreasing) {\n            // DIS hoch: zuerst Out+, dann In−\n            if (OutWRte !== prevOutWRte) {\n                msgOut = { payload: OutWRte };         // zuerst\n                context.set(\"lastOutWRte\", OutWRte);\n            }\n            if (InWRte !== prevInWRte) {\n                msgIn = { payload: InWRte, delay: NEG_DELAY_MS };   // dann (negativ)\n                context.set(\"lastInWRte\", InWRte);\n            }\n        } else if (magDecreasing) {\n            // DIS runter: zuerst In−, dann Out+\n            if (InWRte !== prevInWRte) {\n                msgIn = { payload: InWRte };           // zuerst (negativ, aber ohne Delay)\n                context.set(\"lastInWRte\", InWRte);\n            }\n            if (OutWRte !== prevOutWRte) {\n                msgOut = { payload: OutWRte, delay: NEG_DELAY_MS }; // dann positiv verzögert\n                context.set(\"lastOutWRte\", OutWRte);\n            }\n        } else {\n            // Magnitude quasi gleich → einfache Variante\n            [msgIn, msgOut] = sendSimple();\n        }\n    } else {\n        // sollte eigentlich nicht vorkommen, fallback\n        [msgIn, msgOut] = sendSimple();\n    }\n}\n\n\n// ------------------------------------------------------\n// 7) Node-Status\n// ------------------------------------------------------\n\nnode.status({\n    fill:  \"blue\",\n    shape: \"dot\",\n    text:  `P=${P_set_aux.toFixed(0)}W  In=${InWRte.toFixed(1)}%  Out=${OutWRte.toFixed(1)}%`\n});\n\nreturn [msgIn, msgOut];",
+    "outputs": 2,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 810,
+    "y": 320,
+    "wires": [
+      [
+        "e59afd742522cc54"
+      ],
+      [
+        "2c76319d84bb1869"
+      ]
+    ]
+  },
+  {
+    "id": "e59afd742522cc54",
+    "type": "delay",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "",
+    "pauseType": "delayv",
+    "timeout": "1",
+    "timeoutUnits": "milliseconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "outputs": 1,
+    "x": 1040,
+    "y": 260,
+    "wires": [
+      [
+        "16f2f10796b2f552",
+        "256bc14883438b2a"
+      ]
+    ]
+  },
+  {
+    "id": "2c76319d84bb1869",
+    "type": "delay",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "",
+    "pauseType": "delayv",
+    "timeout": "1",
+    "timeoutUnits": "milliseconds",
+    "rate": "1",
+    "nbRateUnits": "1",
+    "rateUnits": "second",
+    "randomFirst": "1",
+    "randomLast": "5",
+    "randomUnits": "seconds",
+    "drop": false,
+    "allowrate": false,
+    "outputs": 1,
+    "x": 1040,
+    "y": 340,
+    "wires": [
+      [
+        "b6c4d9d1f96d29ec",
+        "620dd57e781859c1"
+      ]
+    ]
+  },
+  {
+    "id": "8295aca0eb955f76",
+    "type": "inject",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "0",
+    "payloadType": "num",
+    "x": 550,
+    "y": 380,
+    "wires": [
+      [
+        "2840a440d760afd1"
+      ]
+    ]
+  },
+  {
+    "id": "0bfae37788036102",
+    "type": "inject",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "100",
+    "payloadType": "num",
+    "x": 170,
+    "y": 340,
+    "wires": [
+      [
+        "2840a440d760afd1"
+      ]
+    ]
+  },
+  {
+    "id": "6abd811bf6ce2ee7",
+    "type": "inject",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "-100",
+    "payloadType": "num",
+    "x": 550,
+    "y": 420,
+    "wires": [
+      [
+        "2840a440d760afd1"
+      ]
+    ]
+  },
+  {
+    "id": "28470fdc86149a0d",
+    "type": "inject",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "250",
+    "payloadType": "num",
+    "x": 170,
+    "y": 380,
+    "wires": [
+      [
+        "2840a440d760afd1"
+      ]
+    ]
+  },
+  {
+    "id": "2d15ca9c76b753cd",
+    "type": "inject",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "-250",
+    "payloadType": "num",
+    "x": 310,
+    "y": 380,
+    "wires": [
+      [
+        "2840a440d760afd1"
+      ]
+    ]
+  },
+  {
+    "id": "8cf9c4224e75567b",
+    "type": "inject",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "0",
+    "payloadType": "num",
+    "x": 870,
+    "y": 240,
+    "wires": [
+      [
+        "e59afd742522cc54",
+        "2c76319d84bb1869"
+      ]
+    ]
+  },
+  {
+    "id": "a848c1995e5b6c48",
+    "type": "ioBroker in",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "OstWest_Akku_Autom_Watt",
+    "attrname": "",
+    "topic": "gira-endpoint.0.CO@.OstWest_Akku_Autom_Watt.value",
+    "payloadType": "value",
+    "onlyack": "",
+    "func": "all",
+    "gap": "",
+    "fireOnStart": "true",
+    "outFormat": "MQTT",
+    "x": 160,
+    "y": 420,
+    "wires": [
+      [
+        "2840a440d760afd1"
+      ]
+    ],
+    "icon": "node-red-contrib-knx-ultimate/node-knx-icon.svg"
+  },
+  {
+    "id": "4e1e789e9d2596fa",
+    "type": "debug",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "Akku soll",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": true,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "payload",
+    "statusType": "auto",
+    "x": 700,
+    "y": 240,
+    "wires": []
+  },
+  {
+    "id": "8fe006138f89debb",
+    "type": "inject",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "1480 -19.3 19.5",
+    "props": [
+      {
+        "p": "payload"
+      }
+    ],
+    "repeat": "",
+    "crontab": "",
+    "once": false,
+    "onceDelay": 0.1,
+    "topic": "",
+    "payload": "-1480",
+    "payloadType": "num",
+    "x": 740,
+    "y": 420,
+    "wires": [
+      [
+        "2840a440d760afd1"
+      ]
+    ]
+  },
+  {
+    "id": "b44640ba25718304",
+    "type": "function",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "flowSet - \"OstWest_Akku_min_SoC\"",
+    "func": "flow.set(\"OstWest_Akku_min_SoC\", msg.payload);\nnode.status({ fill: \"blue\", shape: \"dot\", text: msg.payload });\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1410,
+    "y": 40,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "bcdad9a1b5fbe948",
+    "type": "function",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "flowSet - \"OstWest_Akku_Limit_Charge_Full\"",
+    "func": "flow.set(\"OstWest_Akku_Limit_Charge_Full\", msg.payload);\nnode.status({ fill: \"blue\", shape: \"dot\", text: msg.payload });\nreturn msg;",
+    "outputs": 1,
+    "timeout": "",
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 1430,
+    "y": 100,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "2dd9451432527163",
+    "type": "ioBroker in",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "OstWest_Akku_Limit_Charge_Full",
+    "attrname": "",
+    "topic": "gira-endpoint.0.CO@.OstWest_Akku_Limit_Charge_Full.value",
+    "payloadType": "value",
+    "onlyack": "",
+    "func": "all",
+    "gap": "",
+    "fireOnStart": "true",
+    "outFormat": "MQTT",
+    "x": 1040,
+    "y": 100,
+    "wires": [
+      [
+        "bcdad9a1b5fbe948"
+      ]
+    ],
+    "icon": "node-red-contrib-knx-ultimate/node-knx-icon.svg"
+  },
+  {
+    "id": "107e07a1676989c7",
+    "type": "ioBroker in",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "OstWest_40360_MinRsvPct_set",
+    "attrname": "",
+    "topic": "modbus.7.holdingRegisters.1.40360_MinRsvPct",
+    "payloadType": "value",
+    "onlyack": "",
+    "func": "all",
+    "gap": "",
+    "fireOnStart": "true",
+    "outFormat": "MQTT",
+    "x": 1030,
+    "y": 40,
+    "wires": [
+      [
+        "b44640ba25718304"
+      ]
+    ],
+    "icon": "node-red-contrib-knx-ultimate/node-knx-icon.svg"
+  },
+  {
+    "id": "de0282d370c82790",
+    "type": "comment",
+    "z": "27329a7f09243cee",
+    "g": "6c65f7ab7f9d95a6",
+    "name": "Funktionsbeschreibung",
+    "info": "… (Kommentartext wie in deinem Flow, wird hier für Kürze nicht wiederholt)",
+    "x": 400,
+    "y": 200,
+    "wires": []
+  }
+]
